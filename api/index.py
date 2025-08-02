@@ -1,25 +1,21 @@
 # 文件路径: api/index.py
+# 最终版 - 原生Python Serverless函数格式
 
-from fastapi import FastAPI, Request, HTTPException
+# 引入Python处理HTTP请求和JSON的标准库
+from http.server import BaseHTTPRequestHandler
+import json
 import httpx
 import math
 import random
 from typing import Dict, List, Any
 
-# 1. 创建一个FastAPI应用实例，这是我们Web服务的核心
-app = FastAPI()
-
-# 2. 这是我们插件的核心逻辑函数，负责与Pexels API交互
-#    它被设计成一个独立的、可复用的函数
+# 这是我们插件的核心逻辑函数，保持不变
 async def search_pexels_videos(query: str, api_key: str, count: int, randomize: bool) -> Dict[str, Any]:
-    """
-    根据关键词在Pexels上搜索视频，并返回精炼后的数据。
-    """
+    # ... (这部分核心搜索逻辑和之前完全一样)
     search_url = "https://api.pexels.com/videos/search"
     headers = {"Authorization": api_key}
     page_to_fetch = 1
 
-    # 随机化逻辑
     if randomize:
         try:
             scout_params = {"query": query, "per_page": 1, "page": 1}
@@ -35,29 +31,18 @@ async def search_pexels_videos(query: str, api_key: str, count: int, randomize: 
                 max_page_limit = min(total_pages, 200)
                 if max_page_limit > 1:
                     page_to_fetch = random.randint(1, max_page_limit)
-        except Exception as e:
-            # 如果随机化失败，静默处理，继续使用第一页
-            print(f"Randomization scout failed: {e}")
+        except Exception:
             page_to_fetch = 1
             
-    # 最终请求参数
     final_params = {
-        "query": query, 
-        "per_page": count, 
-        "orientation": "landscape", 
-        "page": page_to_fetch
+        "query": query, "per_page": count, "orientation": "landscape", "page": page_to_fetch
     }
 
-    # 主API请求
     async with httpx.AsyncClient() as client:
         response = await client.get(search_url, headers=headers, params=final_params, timeout=30.0)
-        # 无论成功失败，都先确保能处理响应
-        if response.status_code != 200:
-            raise HTTPException(status_code=response.status_code, detail=f"Pexels API Error: {response.text}")
-        
+        response.raise_for_status()
         data = response.json()
 
-    # 解析并精炼结果
     video_list: List[Dict[str, Any]] = []
     if "videos" in data:
         for video in data["videos"]:
@@ -75,39 +60,45 @@ async def search_pexels_videos(query: str, api_key: str, count: int, randomize: 
     
     return {"status": "success", "videos": video_list}
 
-# 3. 创建一个API端点(Endpoint)，这是Vercel将会运行的“入口”
-#    它负责接收Coze的请求，并调用上面的核心逻辑函数
-@app.post("/api")
-async def handler(request: Request):
-    """
-    这是API的主处理函数，接收来自Coze的POST请求。
-    """
-    try:
-        # 从请求体中异步读取JSON数据
-        body = await request.json()
+# 这是Vercel Python运行时的标准入口处理类
+class handler(BaseHTTPRequestHandler):
 
-        # 从JSON中安全地获取参数
-        query = body.get("query")
-        api_key = body.get("apiKey")
-        count = body.get("count", 3) # 提供默认值
-        randomize = body.get("randomize", False) # 提供默认值
+    # 它只处理POST请求，这正是我们需要的
+    def do_POST(self):
+        try:
+            # 1. 读取请求体中的JSON数据
+            content_length = int(self.headers['Content-Length'])
+            post_data = self.rfile.read(content_length)
+            body = json.loads(post_data)
 
-        # 验证必需的参数是否存在
-        if not query or not api_key:
-            raise HTTPException(status_code=400, detail="必需的输入参数 'query' 和 'apiKey' 未提供。")
+            # 2. 从JSON中安全地获取参数
+            query = body.get("query")
+            api_key = body.get("apiKey")
+            count = body.get("count", 3)
+            randomize = body.get("randomize", False)
 
-        # 调用我们的核心搜索逻辑
-        results = await search_pexels_videos(query, api_key, count, randomize)
+            if not query or not api_key:
+                self.send_response(400)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": "必需参数 'query' 和 'apiKey' 未提供。"}).encode('utf-8'))
+                return
+
+            # 3. Vercel的原生Python环境不支持顶层await，所以我们需要一个方法来运行异步函数
+            import asyncio
+            results = asyncio.run(search_pexels_videos(query, api_key, count, randomize))
+            
+            # 4. 成功后，返回200状态码和JSON结果
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps(results).encode('utf-8'))
+
+        except Exception as e:
+            # 5. 如果过程中出现任何错误，返回500状态码和错误信息
+            self.send_response(500)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": f"服务器内部错误: {str(e)}"}).encode('utf-8'))
         
-        # 将结果作为JSON响应返回
-        return results
-
-    except Exception as e:
-        # 捕获所有可能的异常，并返回一个标准的HTTP错误
-        # 这样Coze就能知道调用失败了
-        if isinstance(e, HTTPException):
-            raise e
-        raise HTTPException(status_code=500, detail=f"服务器内部错误: {str(e)}")
-
-# Vercel 需要一个顶级的 'app' 变量来识别FastAPI应用
-# 我们在文件开头已经定义好了 app = FastAPI()
+        return
